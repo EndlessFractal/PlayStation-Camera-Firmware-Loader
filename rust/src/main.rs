@@ -1,146 +1,143 @@
+use std::env;
+use std::error::Error;
+use std::fs;
+
 fn main() {
-    let firmware_filename: String = std::env::args()
-        .nth(1)
-        .expect("No firmware filename received");
+    if let Err(e) = try_main() {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+}
 
-    // See `libusb` output in documentation for where these come from
-    const USB_VENDOR_ID: u16 = 0x05a9;
-    const USB_PRODUCT_ID_BOOTLOADER: u16 = 0x0580;  // USB Boot mode
-    const USB_PRODUCT_ID_FIRMWARE: u16 = 0x058c;    // USB Camera mode (already programmed)
+fn try_main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().collect();
+    let verbose = args.contains(&"-v".to_string()) || args.contains(&"--verbose".to_string());
+    
+    // Validate args
+    if args.len() < 2 || (args.len() == 2 && verbose) {
+        return Err("Usage: <program> <firmware.bin> [-v]".into());
+    }
+    
+    let firmware_file = &args[1];
+    println!("[*] Firmware: {}", firmware_file);
+    if verbose { println!("[*] Verbose mode enabled"); }
 
-    // Try to open device in bootloader mode, or inform if already programmed
-    let libusb_dev_handle = match rusb::open_device_with_vid_pid(USB_VENDOR_ID, USB_PRODUCT_ID_BOOTLOADER) {
-        Some(handle) => {
-            println!("Found device in bootloader mode. Starting firmware upload...");
-            handle
+    // USB constants
+    const VID: u16 = 0x05a9;
+    const PID_BOOT: u16 = 0x0580;
+    const PID_FW: u16 = 0x058c;
+    const IFACE: u8 = 0;
+    const PKT_SIZE: usize = 512;
+    const REQ_TYPE: u8 = 0x40;
+    const MIN_SIZE: usize = 64 * 1024;
+
+    if verbose {
+        println!("[*] USB Configuration - VID: 0x{:04x}, PID (bootloader): 0x{:04x}, PID (firmware): 0x{:04x}", 
+                 VID, PID_BOOT, PID_FW);
+        println!("[*] Interface: {}, Max packet size: {} bytes, Min firmware size: {} bytes", 
+                 IFACE, PKT_SIZE, MIN_SIZE);
+    }
+
+    // Find device in bootloader mode
+    println!("[*] Searching for device...");
+    let dev = match rusb::open_device_with_vid_pid(VID, PID_BOOT) {
+        Some(h) => { 
+            println!("[✓] Found bootloader mode"); 
+            h 
         }
         None => {
-            // Check if device is already in camera mode
-            match rusb::open_device_with_vid_pid(USB_VENDOR_ID, USB_PRODUCT_ID_FIRMWARE) {
-                Some(camera_handle) => {
-                    // Explicitly close the device handle before exiting, since process::exit skips Drop
-                    drop(camera_handle);
-                    eprintln!("Camera is already programmed and working (Mode: USB Camera-OV580)");
-                    eprintln!("No firmware update needed.");
-                    std::process::exit(0);
-                }
-                None => {
-                    eprintln!("Error: PS5 Camera not found!");
-                    eprintln!("Expected: VID:PID = 05a9:0580 (bootloader) or 05a9:058c (camera)");
-                    std::process::exit(1);
-                }
+            if verbose { println!("[*] Bootloader mode not found, checking camera mode..."); }
+            // Check if already in camera mode
+            if rusb::open_device_with_vid_pid(VID, PID_FW).is_some() {
+                println!("[✓] Already in camera mode");
+                return Ok(());
             }
+            return Err("Camera not found (VID:PID 05a9:0580 or 05a9:058c)".into());
         }
     };
 
-    // Device only has one USB 'endpoint'/interface (see `lsusb` output)
-    const USB_INTERFACE_NUM: u8 = 0;
+    // Setup USB interface
+    if verbose { println!("[*] Checking kernel driver status..."); }
+    if let Ok(true) = dev.kernel_driver_active(IFACE) {
+        if verbose { println!("[!] Kernel driver is active, detaching..."); }
+        let _ = dev.detach_kernel_driver(IFACE);
+        if verbose { println!("[✓] Kernel driver detached"); }
+    } else if verbose {
+        println!("[✓] Kernel driver not active");
+    }
+    
+    if verbose { println!("[*] Claiming interface {}...", IFACE); }
+    dev.claim_interface(IFACE)?;
+    if verbose { println!("[✓] Interface claimed"); }
+    println!("[✓] USB ready");
 
-    /* Check if the device is in use by the kernel driver; if it is, then you'll
-    need to "detach" it so that libusb can claim it.
-    The device should almost never be claimed by the kernel driver unless you're already
-    actively using it */
+    // Read firmware file
+    println!("[*] Reading firmware...");
+    let fw = fs::read(firmware_file)?;
+    let fw_len = fw.len();
+    println!("[*] Size: {} bytes ({:.2} KB)", fw_len, fw_len as f64 / 1024.0);
+    
+    if fw_len < MIN_SIZE {
+        return Err(format!("File too small: {} < {}", fw_len, MIN_SIZE).into());
+    }
+    if verbose { println!("[✓] Firmware size is valid"); }
 
-    if libusb_dev_handle
-        .kernel_driver_active(USB_INTERFACE_NUM)
-        .unwrap()
-    {
-        println!("Kernel is currently using device, detaching it before continuing..");
-        libusb_dev_handle
-            .detach_kernel_driver(USB_INTERFACE_NUM)
-            .unwrap();
+    // Upload firmware in packets
+    println!("[*] Uploading...");
+    if verbose {
+        println!("[*] Total packets to send: {}", (fw_len + PKT_SIZE - 1) / PKT_SIZE);
+    }
+    
+    let mut offset = 0;
+    let mut w_value: u16 = 0;
+    let mut pkt_num = 0;
+
+    while offset < fw_len {
+        let size = std::cmp::min(fw_len - offset, PKT_SIZE);
+        let idx = if offset < (u16::MAX as usize) { 0x14 } else { 0x15 };
+
+        if verbose {
+            println!("[*] Packet {}: {} bytes [offset: {} - {}], wValue=0x{:04x}, wIndex=0x{:04x}",
+                     pkt_num, size, offset, offset + size, w_value, idx);
+        }
+
+        match dev.write_control(REQ_TYPE, 0x0, w_value, idx, &fw[offset..offset + size], std::time::Duration::from_secs(5)) {
+            Ok(bytes) => {
+                if verbose {
+                    println!("[✓] Packet {} transferred {} bytes", pkt_num, bytes);
+                }
+            }
+            Err(e) => {
+                println!("[✗] Packet {} failed: {:?}", pkt_num, e);
+                return Err(format!("Failed to send packet {}: {:?}", pkt_num, e).into());
+            }
+        }
+        
+        w_value = w_value.wrapping_add(size as u16);
+        offset += size;
+        pkt_num += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
-    libusb_dev_handle
-        .claim_interface(USB_INTERFACE_NUM)
-        .unwrap();
+    println!("[✓] {} packets sent", pkt_num);
 
-    // USB device is setup and ready to communicate to!
-
-    let firmware_file_as_bytes: Vec<u8> = std::fs::read(firmware_filename).unwrap();
-
-    // USB official standard limits packet size to 512 bytes
-    const USB_MAX_PACKET_SIZE: u16 = 512;
-
-    /* Constant comes from the bitmask: 0b1000000
-    Result of setting 'Data Phase Transfer Detection' bit to 1, all others to 0
-    See: https://www.beyondlogic.org/usbnutshell/usb6.shtml */
-    const USB_OUTGOING_PACKET_BM_REQUEST_TYPE: u8 = 0x40;
-
-    let firmware_file_len = firmware_file_as_bytes.len();
-
-    // Firmware files need to be at least 64 KB in size
-    const MIN_FIRMWARE_FILE_SIZE: u16 = u16::MAX;
-
-    if firmware_file_len < (MIN_FIRMWARE_FILE_SIZE as usize) {
-        panic!(
-            "Firmware file size is insufficient. Expected={}, actual size={}",
-            MIN_FIRMWARE_FILE_SIZE, firmware_file_len
-        )
-    }
-
-    let mut file_byte_idx: usize = 0;
-
-    // Not sure why this is the starting value. Constant was taken from OrbisEyeCam implementation
-    let lower_transaction_idx: u16 = 0x14; // 20d
-    let upper_transaction_idx = 0x15; // 21d
-
-    /* Goes from 0 to 65536, incrementing by 512. Then, starts over at 0, and continues incrementing.
-    This is again something that was taken from OrbisEyeCam
-    Corresponds to 'wValue' in standard USB semantics */
-    let mut w_value = std::num::Wrapping(std::u16::MAX);
-    w_value.0 = 0;
-
-    while file_byte_idx < firmware_file_len {
-        let pkt_size = std::cmp::min(
-            firmware_file_len - file_byte_idx,
-            USB_MAX_PACKET_SIZE as usize,
-        );
-
-        let pkt_end_idx: usize = file_byte_idx + (pkt_size as usize);
-
-        let cur_transaction_idx = if file_byte_idx < (std::u16::MAX as usize) {
-            lower_transaction_idx
-        } else {
-            upper_transaction_idx
-        };
-
-        let _bytes_transferred = libusb_dev_handle
-            .write_control(
-                USB_OUTGOING_PACKET_BM_REQUEST_TYPE,
-                0x0,
-                w_value.0,
-                cur_transaction_idx,
-                &firmware_file_as_bytes[file_byte_idx as usize..pkt_end_idx],
-                std::time::Duration::ZERO,
-            )
-            .unwrap();
-
-        // Careful with this log statement. Logging in between USB transactions can slow things down enough to where it no longer works
-        //println!("Transferred {} bytes [{} , {}], value= {}, index= {}", bytes_transferred, file_byte_idx, pkt_end_idx, w_value.0, transaction_idx);
-
-        w_value += pkt_size as u16;
-        file_byte_idx += pkt_size as usize;
-    }
-
-    // Again, taken from OrbisEyeCam
-    let footer_packet: [u8; 1] = [0x5B];
-
-    match libusb_dev_handle.write_control(
-        USB_OUTGOING_PACKET_BM_REQUEST_TYPE,
-        0x0,
-        0x2200,
-        0x8018,
-        &footer_packet,
-        std::time::Duration::ZERO,
-    ) {
-        Ok(_) => println!("✓ Firmware uploaded successfully!"),
+    // Send footer packet
+    println!("[*] Finalizing...");
+    if verbose { println!("[*] Sending footer packet (0x5B)..."); }
+    match dev.write_control(REQ_TYPE, 0x0, 0x2200, 0x8018, &[0x5B], std::time::Duration::from_secs(5)) {
+        Ok(bytes) => {
+            if verbose { println!("[✓] Footer packet sent ({} bytes)", bytes); }
+            println!("[✓] Done!");
+        }
         Err(rusb::Error::NoDevice) => {
-            println!("✓ Firmware uploaded successfully! Camera is restarting...");
+            if verbose { println!("[*] Device disconnected during finalization"); }
+            println!("[✓] Device restarting...");
         }
         Err(e) => {
-            eprintln!("✗ Error sending final packet: {:?}", e);
-            std::process::exit(1);
+            println!("[✗] Footer failed: {:?}", e);
+            return Err(format!("Footer failed: {:?}", e).into());
         }
     }
+
+    Ok(())
 }
